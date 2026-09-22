@@ -15,7 +15,7 @@ A memory-optimised PyTorch and Hugging Face TRL fine-tuning pipeline designed fo
 
 ### 1. Clone Repository & Setup Environment
 ```bash
-git clone [https://github.com/Stephen-Dev-ctrl/Intel-Model-Training_MachTrain.git](https://github.com/Stephen-Dev-ctrl/Intel-Model-Training_MachTrain.git)
+git clone https://github.com/Stephen-Dev-ctrl/Intel-Model-Training_MachTrain.git
 cd Intel-Model-Training_MachTrain
 python -m venv .venv
 .venv\Scripts\activate
