@@ -1,0 +1,204 @@
+import json
+import os
+import torch
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForImageTextToText, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+
+CONFIG_FILE = "training_config.json"
+
+
+def get_user_preferences():
+    """Interactively gets or loads max_steps and warmup_steps."""
+    max_steps = 10
+    warmup_steps = 2
+
+    # 1. Check if saved preferences exist
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+            use_saved = input(
+                f"⚙️ Saved preferences found (Steps: {saved.get('max_steps')}, Warmup: {saved.get('warmup_steps')}). Use these? (y/n) [default: y]: "
+            ).strip().lower()
+
+            if use_saved in ["", "y", "yes"]:
+                return saved["max_steps"], saved["warmup_steps"]
+        except Exception:
+            pass
+
+    # 2. Prompt user for custom steps
+    print("\n🎛️ Interactive Training Setup:")
+    steps_input = input("  ➡️ Enter total training steps (e.g., 10 for ~15 mins, 75 for ~2 hours) [default: 10]: ").strip()
+    if steps_input.isdigit() and int(steps_input) > 0:
+        max_steps = int(steps_input)
+
+    warmup_input = input(f"  ➡️ Enter warmup steps [default: {min(2, max_steps)}]: ").strip()
+    if warmup_input.isdigit():
+        warmup_steps = int(warmup_input)
+
+    # 3. Ask to save preferences
+    save_pref = input("  💾 Save these settings for future runs? (y/n) [default: y]: ").strip().lower()
+    if save_pref in ["", "y", "yes"]:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"max_steps": max_steps, "warmup_steps": warmup_steps}, f, indent=4)
+        print("  ✅ Preferences saved to 'training_config.json'!\n")
+
+    return max_steps, warmup_steps
+
+
+def select_and_load_dataset():
+    """Allows user to select between pre-blended dataset or custom local file / HF repo."""
+    blended_file = "Blended_Dataset.jsonl"
+
+    print("\n📊 Dataset Options:")
+    print(f"  [1] Pre-blended Dataset ('{blended_file}')")
+    print("  [2] Custom Dataset (Local file path or Hugging Face ID)")
+
+    choice = input("\n➡️ Choose dataset source (1 or 2) [default: 1]: ").strip()
+
+    if choice == "2":
+        ds_input = input("➡️ Enter local path (.jsonl, .json, .csv) or HF ID (e.g., 'username/repo'): ").strip()
+        if not ds_input:
+            raise ValueError("Dataset path/ID cannot be empty.")
+
+        print(f"\n⏳ Loading custom dataset from: '{ds_input}'...")
+        if os.path.exists(ds_input):
+            ext = os.path.splitext(ds_input)[-1].lower()
+            if ext in [".json", ".jsonl"]:
+                dataset = load_dataset("json", data_files=ds_input, split="train")
+            elif ext == ".csv":
+                dataset = load_dataset("csv", data_files=ds_input, split="train")
+            else:
+                raise ValueError(f"Unsupported file extension '{ext}'. Use .json, .jsonl, or .csv")
+        else:
+            if "huggingface.co/datasets/" in ds_input:
+                ds_input = ds_input.split("huggingface.co/datasets/")[-1].rstrip("/")
+            dataset = load_dataset(ds_input, split="train")
+
+        # Auto-format into ChatML 'text' field if not already formatted
+        if "text" not in dataset.column_names:
+            print("🔄 Formatting dataset into ChatML ('text' field)...")
+
+            def format_to_chatml(row):
+                messages = row.get("messages") or row.get("conversations")
+                if messages and isinstance(messages, list):
+                    parts = []
+                    for m in messages:
+                        r = m.get("role") or ("user" if m.get("from") in ["human", "user"] else "assistant")
+                        c = m.get("content") or m.get("value", "")
+                        parts.append(f"<|im_start|>{r}\n{c}<|im_end|>")
+                    return {"text": "\n".join(parts)}
+
+                u_keys = ["question", "instruction", "prompt", "input", "problem"]
+                a_keys = ["answer", "output", "response", "solution", "code"]
+                u_text = next((str(row[k]) for k in u_keys if k in row and row[k]), "")
+                a_text = next((str(row[k]) for k in a_keys if k in row and row[k]), "")
+                return {"text": f"<|im_start|>user\n{u_text}<|im_end|>\n<|im_start|>assistant\n{a_text}<|im_end|>"}
+
+            dataset = dataset.map(format_to_chatml)
+
+        return dataset, ds_input
+
+    else:
+        if not os.path.exists(blended_file):
+            raise FileNotFoundError(
+                f"❌ Error: '{blended_file}' missing! Run 'blend_datasets.py' or choose Option 2 for a custom dataset."
+            )
+        print(f"\n📈 Pre-blended dataset detected. Loading '{blended_file}'...")
+        return load_dataset("json", data_files=blended_file, split="train"), blended_file
+
+
+def calculate_time_estimate(steps):
+    """Dynamically formats time string based on steps (~1.6 mins per step on CPU)."""
+    total_minutes = round(steps * 1.6)
+    if total_minutes < 60:
+        return f"{total_minutes}-minute" if total_minutes > 0 else "1-minute"
+
+    hours = total_minutes // 60
+    remaining_mins = total_minutes % 60
+    if remaining_mins == 0:
+        return f"{hours}-hour"
+    return f"{hours}-hour {remaining_mins}-minute"
+
+
+# Interactive user prompts before running expensive operations
+max_steps, warmup_steps = get_user_preferences()
+train_ready_dataset, dataset_source = select_and_load_dataset()
+time_label = calculate_time_estimate(max_steps)
+
+print("\n" + "=" * 60)
+print(f"⏱️ INTEL CPU {time_label.upper()} ({max_steps} STEPS) TARGETED TRAINING ENGINE")
+print("=" * 60)
+
+# 1. LOAD MODEL INTO SYSTEM RAM
+model_name = (
+    "./uncompressed_model"
+    if os.path.exists("./uncompressed_model")
+    else "Qwen/Qwen2.5-VL-3B-Instruct"
+)
+print(f"\n🧠 Loading Model weights into Intel RAM from: '{model_name}'...")
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForImageTextToText.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,  # Cuts model RAM size from 12GB to ~6GB
+    device_map="cpu",            # Forces execution on Intel CPU
+    trust_remote_code=True,
+)
+
+# Prevents RAM accumulation explosions during the training loop
+model.gradient_checkpointing_enable()
+
+print(f"\n📈 Dataset successfully staged from '{dataset_source}'! Total items to process: {len(train_ready_dataset)}")
+
+# 2. ATTACH LORA ADAPTERS
+print("\n🛠️ Attaching LoRA Fine-Tuning Adapters...")
+peft_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()
+
+# 3. INITIALIZE TRAINER WITH DYNAMIC STEPS
+print("\n🔥 Initializing Supervised Fine-Tuning Trainer...")
+trainer = SFTTrainer(
+    model=model,
+    processing_class=tokenizer,
+    train_dataset=train_ready_dataset,
+    args=SFTConfig(
+        use_cpu=True,
+        dataset_text_field="text",
+        max_length=256,
+        packing=False,
+        dataloader_num_workers=0,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        warmup_steps=warmup_steps,
+        max_steps=max_steps,   # Dynamically set from user choice
+        learning_rate=2e-4,
+        logging_steps=1,
+        optim="adafactor",
+        output_dir="training_checkpoints",
+        report_to="none",
+    ),
+)
+
+print(f"\n🚀 STARTING {time_label.upper()} ({max_steps} STEPS) FINE-TUNING LOOP!")
+print("Your model is training. Sit back and let the CPU cook!")
+trainer.train()
+
+output_model_folder = "Trained_model"
+print(f"\n💾 Saving {time_label} fine-tuned weights to './{output_model_folder}'...")
+model.save_pretrained(output_model_folder)
+tokenizer.save_pretrained(output_model_folder)
+print(f"\n🎉 SUCCESS! Saved {time_label} trained VL model to './{output_model_folder}'!")
