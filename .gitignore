@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local downloaded models and fine-tuned outputs
+uncompressed_qwen_model/
+corporate_finance_model/
+merged-model/
+qwen2.5-3b-text-only/
+training_checkpoints/
+*.gguf
+*.jsonl
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
