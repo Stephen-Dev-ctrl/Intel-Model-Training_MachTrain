@@ -1,7 +1,7 @@
 WARNING! I AM NOT RESPONSIBLE FOR ANYTHING THAT HAPPENDS TO YOUR COMPUTER
 
 
-# Qwen2.5-VL Low-RAM Targeted Fine-Tuning Engine
+# Intel-GPU-Targeted Fine-Tuning Engine
 
 A memory-optimized PyTorch and Hugging Face TRL fine-tuning pipeline designed for training vision-language models on systems with constrained VRAM/RAM (e.g., Intel processors with integrated graphics).
 
